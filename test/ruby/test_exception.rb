@@ -724,6 +724,21 @@ end.join
   rescue SystemStackError
   end
 
+  def test_machine_stackoverflow_twice
+    # The second overflow used to kill the process with SIGILL on macOS,
+    # because the first one had left the thread marked as still running
+    # on its alternate signal stack.
+    bug13164 = '[Bug #13164]'
+    assert_separately([], "#{<<-"begin;"}\n#{<<~"end;"}", timeout: 60)
+    begin;
+      a = []
+      100_000.times {a = [a]}
+      2.times do
+        assert_raise(SystemStackError, #{bug13164.dump}) {a.inspect}
+      end
+    end;
+  end
+
   def test_machine_stackoverflow_by_define_method
     bug9454 = '[ruby-core:60113] [Bug #9454]'
     assert_separately([], <<-SRC)

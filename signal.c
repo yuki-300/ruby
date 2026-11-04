@@ -801,9 +801,66 @@ reset_sigmask(int sig)
 #endif
 }
 
-# ifdef USE_UCONTEXT_REG
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(__arm64__))
+/*
+ * Darwin keeps "this thread is running on its alternate signal stack"
+ * as kernel state, and only sigreturn(2) clears it.  Jumping out of
+ * the SIGSEGV handler with longjmp skips sigreturn, so after the first
+ * SystemStackError the thread stays marked as being on the alternate
+ * stack.  The next guard page fault then cannot use the alternate
+ * stack, cannot be delivered on the overflowed stack either, and the
+ * kernel kills the process with SIGILL.
+ *
+ * So on Darwin the handler does not jump.  It rewrites the saved
+ * register state so that returning from the handler resumes the
+ * thread in stack_overflow_trampoline() on the (now released)
+ * alternate stack, and the jump happens there.  [Bug #13164]
+ */
+# define STACK_OVERFLOW_VIA_SIGRETURN 1
+
+NORETURN(static void stack_overflow_trampoline(rb_execution_context_t *ec, ruby_stack_overflow_critical_level crit));
 static void
-check_stack_overflow(int sig, const uintptr_t addr, const ucontext_t *ctx)
+stack_overflow_trampoline(rb_execution_context_t *ec, ruby_stack_overflow_critical_level crit)
+{
+    rb_ec_stack_overflow(ec, crit);
+}
+
+/* Returns true if the context was rewritten and the handler must return. */
+static int
+stack_overflow_resume(void *vctx, rb_execution_context_t *ec, ruby_stack_overflow_critical_level crit)
+{
+    ucontext_t *uc = vctx;
+    stack_t ss;
+    uintptr_t sp;
+
+    if (!uc || sigaltstack(NULL, &ss) != 0 || (ss.ss_flags & SS_DISABLE) || !ss.ss_sp) {
+        return FALSE;
+    }
+    /* The whole alternate stack belongs to this signal delivery and is
+     * free again once the handler has returned. */
+    sp = ((uintptr_t)ss.ss_sp + ss.ss_size) & ~(uintptr_t)0xf;
+    clear_received_signal();
+# if defined(__x86_64__)
+    uc->uc_mcontext->__ss.__rip = (uintptr_t)stack_overflow_trampoline;
+    uc->uc_mcontext->__ss.__rsp = sp - sizeof(void *); /* as if a return address were pushed */
+    uc->uc_mcontext->__ss.__rbp = 0;
+    uc->uc_mcontext->__ss.__rdi = (uintptr_t)ec;
+    uc->uc_mcontext->__ss.__rsi = (uintptr_t)crit;
+# else
+    __darwin_arm_thread_state64_set_pc_fptr(uc->uc_mcontext->__ss, stack_overflow_trampoline);
+    __darwin_arm_thread_state64_set_lr_fptr(uc->uc_mcontext->__ss, NULL);
+    __darwin_arm_thread_state64_set_sp(uc->uc_mcontext->__ss, sp);
+    __darwin_arm_thread_state64_set_fp(uc->uc_mcontext->__ss, 0);
+    uc->uc_mcontext->__ss.__x[0] = (uintptr_t)ec;
+    uc->uc_mcontext->__ss.__x[1] = (uintptr_t)crit;
+# endif
+    return TRUE;
+}
+#endif
+
+# ifdef USE_UCONTEXT_REG
+static int
+check_stack_overflow(int sig, const uintptr_t addr, ucontext_t *ctx)
 {
     const DEFINE_MCONTEXT_PTR(mctx, ctx);
 # if defined __linux__
@@ -863,33 +920,44 @@ check_stack_overflow(int sig, const uintptr_t addr, const ucontext_t *ctx)
             rb_vm_tag_jmpbuf_deinit(&ec->tag->buf);
             ec->tag = ec->tag->prev;
         }
+#ifdef STACK_OVERFLOW_VIA_SIGRETURN
+        if (stack_overflow_resume(ctx, ec, crit)) return TRUE;
+#endif
         reset_sigmask(sig);
         rb_ec_stack_overflow(ec, crit);
     }
+    return FALSE;
 }
 # else
-static void
-check_stack_overflow(int sig, const void *addr)
+static int
+check_stack_overflow(int sig, const void *addr, void *ctx)
 {
     int ruby_stack_overflowed_p(const rb_thread_t *, const void *);
     rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (!ec) return;
+    if (!ec) return FALSE;
     rb_thread_t *th = rb_ec_thread_ptr(ec);
     if (ruby_stack_overflowed_p(th, addr)) {
+#ifdef STACK_OVERFLOW_VIA_SIGRETURN
+        if (stack_overflow_resume(ctx, th->ec, rb_stack_overflow_signal)) return TRUE;
+#endif
         reset_sigmask(sig);
         rb_ec_stack_overflow(th->ec, 1);
     }
+    return FALSE;
 }
 # endif
 
+/* check_stack_overflow() returns true when the fault was a machine stack
+ * overflow and the saved context has been rewritten so that the error is
+ * raised after the handler returns; the handler must then just return. */
 # ifdef _WIN32
-#   define CHECK_STACK_OVERFLOW() check_stack_overflow(sig, 0)
+#   define CHECK_STACK_OVERFLOW() do { if (check_stack_overflow(sig, 0, NULL)) return; } while (0)
 # else
 #   define FAULT_ADDRESS info->si_addr
 #   ifdef USE_UCONTEXT_REG
 #     define CHECK_STACK_OVERFLOW_() check_stack_overflow(sig, (uintptr_t)FAULT_ADDRESS, ctx)
 #   else
-#     define CHECK_STACK_OVERFLOW_() check_stack_overflow(sig, FAULT_ADDRESS)
+#     define CHECK_STACK_OVERFLOW_() check_stack_overflow(sig, FAULT_ADDRESS, ctx)
 #   endif
 
 /* Only the si_code values whose siginfo_t carries a sender pid; SI_TIMER and
@@ -927,7 +995,7 @@ signal_sender_message(const siginfo_t *info)
 
 #   define MESSAGE_FAULT_ADDRESS " at %p%s", FAULT_ADDRESS, signal_sender_message(info)
 #   define SIGNAL_FROM_USER_P() ((info)->si_code == SI_USER)
-#   define CHECK_STACK_OVERFLOW() (SIGNAL_FROM_USER_P() ? (void)0 : CHECK_STACK_OVERFLOW_())
+#   define CHECK_STACK_OVERFLOW() do { if (!SIGNAL_FROM_USER_P() && CHECK_STACK_OVERFLOW_()) return; } while (0)
 # endif
 #else
 # define CHECK_STACK_OVERFLOW() (void)0
@@ -945,7 +1013,7 @@ NOINLINE(static void check_reserved_signal_(const char *name, size_t name_len, i
 #ifdef SIGBUS
 
 static sighandler_t default_sigbus_handler;
-NORETURN(static ruby_sigaction_t sigbus);
+static ruby_sigaction_t sigbus;
 
 static void
 sigbus(int sig SIGINFO_ARG)
@@ -967,7 +1035,7 @@ sigbus(int sig SIGINFO_ARG)
 #ifdef SIGSEGV
 
 static sighandler_t default_sigsegv_handler;
-NORETURN(static ruby_sigaction_t sigsegv);
+static ruby_sigaction_t sigsegv;
 
 static void
 sigsegv(int sig SIGINFO_ARG)
@@ -981,7 +1049,7 @@ sigsegv(int sig SIGINFO_ARG)
 #ifdef SIGABRT
 
 static sighandler_t default_sigabrt_handler;
-NORETURN(static ruby_sigaction_t sigabrt);
+static ruby_sigaction_t sigabrt;
 
 static void
 sigabrt(int sig SIGINFO_ARG)
@@ -995,7 +1063,7 @@ sigabrt(int sig SIGINFO_ARG)
 #ifdef SIGILL
 
 static sighandler_t default_sigill_handler;
-NORETURN(static ruby_sigaction_t sigill);
+static ruby_sigaction_t sigill;
 
 static void
 sigill(int sig SIGINFO_ARG)
