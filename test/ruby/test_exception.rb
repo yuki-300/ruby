@@ -724,6 +724,22 @@ end.join
   rescue SystemStackError
   end
 
+  def test_machine_stackoverflow_twice
+    # Only reaches the signal handler if the machine stack overflows
+    # before the VM stack does, as with the default 8MB on macOS.
+    # A new array each time, as the tags check_stack_overflow() drops
+    # can leave the recursion guard of the previous inspect behind.
+    bug13164 = '[Bug #13164]'
+    assert_separately([], "#{<<-"begin;"}\n#{<<~"end;"}", timeout: 60)
+    begin;
+      2.times do
+        a = []
+        100_000.times {a = [a]}
+        assert_raise(SystemStackError, #{bug13164.dump}) {a.inspect}
+      end
+    end;
+  end
+
   def test_machine_stackoverflow_by_define_method
     bug9454 = '[ruby-core:60113] [Bug #9454]'
     assert_separately([], <<-SRC)
