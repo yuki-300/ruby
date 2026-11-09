@@ -801,9 +801,70 @@ reset_sigmask(int sig)
 #endif
 }
 
-# ifdef USE_UCONTEXT_REG
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(__arm64__)) && \
+    !defined(RUBY_ASAN_ENABLED)
+/*
+ * Darwin keeps "this thread is on its alternate signal stack" as kernel
+ * state, and only sigreturn(2) clears it.  A longjmp out of the handler
+ * leaves it set, and the next stack overflow in the thread can no
+ * longer be delivered; the kernel kills the process with SIGILL.
+ *
+ * So the handler returns instead, to stack_overflow_trampoline() on the
+ * alternate stack, and the jump happens there.  [Bug #13164]
+ *
+ * Not with ASan, which tells the stacks apart by that same state.
+ */
+# define STACK_OVERFLOW_VIA_SIGRETURN 1
+
+NORETURN(static void stack_overflow_trampoline(rb_execution_context_t *ec, ruby_stack_overflow_critical_level crit));
 static void
-check_stack_overflow(int sig, const uintptr_t addr, const ucontext_t *ctx)
+stack_overflow_trampoline(rb_execution_context_t *ec, ruby_stack_overflow_critical_level crit)
+{
+    rb_ec_stack_overflow(ec, crit);
+}
+
+/* Returns true if the context was rewritten and the handler must return. */
+static int
+stack_overflow_resume(ucontext_t *uc, rb_execution_context_t *ec, ruby_stack_overflow_critical_level crit)
+{
+    stack_t ss;
+    uintptr_t sp;
+
+    /* rb_bug() in the handler, where the C backtrace still shows the
+     * frames that overflowed. */
+    if (rb_during_gc()) return FALSE;
+
+    if (sigaltstack(NULL, &ss) != 0 || !(ss.ss_flags & SS_ONSTACK)) return FALSE;
+
+    /* The lower half, as the next signal for the alternate stack is
+     * delivered at its top again. */
+    sp = ((uintptr_t)ss.ss_sp + ss.ss_size / 2) & ~(uintptr_t)0xf;
+    clear_received_signal();
+# if defined(__x86_64__)
+    sp -= sizeof(uintptr_t);    /* return address */
+    *(uintptr_t *)sp = 0;
+    uc->uc_mcontext->__ss.__rip = (uintptr_t)stack_overflow_trampoline;
+    uc->uc_mcontext->__ss.__rsp = sp;
+    uc->uc_mcontext->__ss.__rbp = 0;
+    uc->uc_mcontext->__ss.__rdi = (uintptr_t)ec;
+    uc->uc_mcontext->__ss.__rsi = (uintptr_t)crit;
+# else
+    __darwin_arm_thread_state64_set_pc_fptr(uc->uc_mcontext->__ss, &stack_overflow_trampoline);
+    __darwin_arm_thread_state64_set_lr_fptr(uc->uc_mcontext->__ss, NULL);
+    __darwin_arm_thread_state64_set_sp(uc->uc_mcontext->__ss, sp);
+    __darwin_arm_thread_state64_set_fp(uc->uc_mcontext->__ss, 0);
+    uc->uc_mcontext->__ss.__x[0] = (uintptr_t)ec;
+    uc->uc_mcontext->__ss.__x[1] = (uintptr_t)crit;
+# endif
+    return TRUE;
+}
+#else
+# define stack_overflow_resume(uc, ec, crit) FALSE
+#endif
+
+# ifdef USE_UCONTEXT_REG
+static int
+check_stack_overflow(int sig, const uintptr_t addr, ucontext_t *ctx, int resumable)
 {
     const DEFINE_MCONTEXT_PTR(mctx, ctx);
 # if defined __linux__
@@ -863,33 +924,37 @@ check_stack_overflow(int sig, const uintptr_t addr, const ucontext_t *ctx)
             rb_vm_tag_jmpbuf_deinit(&ec->tag->buf);
             ec->tag = ec->tag->prev;
         }
+        if (resumable && stack_overflow_resume(ctx, ec, crit)) return TRUE;
         reset_sigmask(sig);
         rb_ec_stack_overflow(ec, crit);
     }
+    return FALSE;
 }
 # else
-static void
-check_stack_overflow(int sig, const void *addr)
+static int
+check_stack_overflow(int sig, const void *addr, void *ctx, int resumable)
 {
     int ruby_stack_overflowed_p(const rb_thread_t *, const void *);
     rb_execution_context_t *ec = rb_current_execution_context(false);
-    if (!ec) return;
+    if (!ec) return FALSE;
     rb_thread_t *th = rb_ec_thread_ptr(ec);
     if (ruby_stack_overflowed_p(th, addr)) {
+        if (resumable && stack_overflow_resume(ctx, th->ec, rb_stack_overflow_signal)) return TRUE;
         reset_sigmask(sig);
-        rb_ec_stack_overflow(th->ec, 1);
+        rb_ec_stack_overflow(th->ec, rb_stack_overflow_signal);
     }
+    return FALSE;
 }
 # endif
 
 # ifdef _WIN32
-#   define CHECK_STACK_OVERFLOW() check_stack_overflow(sig, 0)
+#   define CHECK_STACK_OVERFLOW() (void)check_stack_overflow(sig, 0, NULL, FALSE)
 # else
 #   define FAULT_ADDRESS info->si_addr
 #   ifdef USE_UCONTEXT_REG
-#     define CHECK_STACK_OVERFLOW_() check_stack_overflow(sig, (uintptr_t)FAULT_ADDRESS, ctx)
+#     define CHECK_STACK_OVERFLOW_(resumable) check_stack_overflow(sig, (uintptr_t)FAULT_ADDRESS, ctx, resumable)
 #   else
-#     define CHECK_STACK_OVERFLOW_() check_stack_overflow(sig, FAULT_ADDRESS)
+#     define CHECK_STACK_OVERFLOW_(resumable) check_stack_overflow(sig, FAULT_ADDRESS, ctx, resumable)
 #   endif
 
 /* Only the si_code values whose siginfo_t carries a sender pid; SI_TIMER and
@@ -927,10 +992,21 @@ signal_sender_message(const siginfo_t *info)
 
 #   define MESSAGE_FAULT_ADDRESS " at %p%s", FAULT_ADDRESS, signal_sender_message(info)
 #   define SIGNAL_FROM_USER_P() ((info)->si_code == SI_USER)
-#   define CHECK_STACK_OVERFLOW() (SIGNAL_FROM_USER_P() ? (void)0 : CHECK_STACK_OVERFLOW_())
+#   define CHECK_STACK_OVERFLOW() (SIGNAL_FROM_USER_P() ? (void)0 : (void)CHECK_STACK_OVERFLOW_(FALSE))
 # endif
 #else
 # define CHECK_STACK_OVERFLOW() (void)0
+#endif
+
+/* For SIGSEGV and SIGBUS, whose handlers run on the alternate stack. */
+#ifdef STACK_OVERFLOW_VIA_SIGRETURN
+# define CHECK_STACK_OVERFLOW_ON_ALTSTACK() do { \
+        if (!SIGNAL_FROM_USER_P() && CHECK_STACK_OVERFLOW_(TRUE)) return; \
+    } while (0)
+# define NORETURN_ON_ALTSTACK(x) x
+#else
+# define CHECK_STACK_OVERFLOW_ON_ALTSTACK() CHECK_STACK_OVERFLOW()
+# define NORETURN_ON_ALTSTACK(x) NORETURN(x)
 #endif
 #ifndef MESSAGE_FAULT_ADDRESS
 # define MESSAGE_FAULT_ADDRESS
@@ -945,7 +1021,7 @@ NOINLINE(static void check_reserved_signal_(const char *name, size_t name_len, i
 #ifdef SIGBUS
 
 static sighandler_t default_sigbus_handler;
-NORETURN(static ruby_sigaction_t sigbus);
+NORETURN_ON_ALTSTACK(static ruby_sigaction_t sigbus);
 
 static void
 sigbus(int sig SIGINFO_ARG)
@@ -958,7 +1034,7 @@ sigbus(int sig SIGINFO_ARG)
  */
     /* Seems Linux also delivers SIGBUS. */
 #if defined __APPLE__ || defined __linux__
-    CHECK_STACK_OVERFLOW();
+    CHECK_STACK_OVERFLOW_ON_ALTSTACK();
 #endif
     rb_bug_for_fatal_signal(default_sigbus_handler, sig, SIGINFO_CTX, "Bus Error" MESSAGE_FAULT_ADDRESS);
 }
@@ -967,13 +1043,13 @@ sigbus(int sig SIGINFO_ARG)
 #ifdef SIGSEGV
 
 static sighandler_t default_sigsegv_handler;
-NORETURN(static ruby_sigaction_t sigsegv);
+NORETURN_ON_ALTSTACK(static ruby_sigaction_t sigsegv);
 
 static void
 sigsegv(int sig SIGINFO_ARG)
 {
     check_reserved_signal("SEGV");
-    CHECK_STACK_OVERFLOW();
+    CHECK_STACK_OVERFLOW_ON_ALTSTACK();
     rb_bug_for_fatal_signal(default_sigsegv_handler, sig, SIGINFO_CTX, "Segmentation fault" MESSAGE_FAULT_ADDRESS);
 }
 #endif
